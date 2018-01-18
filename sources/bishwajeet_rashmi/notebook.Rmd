@@ -1,0 +1,226 @@
+---
+title: "Crystal Discoball Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("ggplot2")
+require("reshape2")
+require("knitr")
+require("kableExtra")
+require("dplyr")
+require("RColorBrewer")
+require("stringr")
+```
+
+
+```{r, echo=F}
+songInfo <- read.csv('input-full/song_info.csv', sep=';', header=TRUE, quote="", stringsAsFactors = FALSE)
+```
+
+### 1. Count the number of jams
+
+Jams are equivalent of likes - https://labrosa.ee.columbia.edu/millionsong/thisismyjam . We have around 100,000+ tracks.
+
+```{r, echo=F}
+jamTracks <- read.csv("input-full/jam_to_msd.tsv", sep='\t', stringsAsFactors = FALSE, col.names=c("user_id", "track_id"))
+
+jamTracksCount <- jamTracks %>%
+  group_by(track_id) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+
+jamTracksCount <- rename(jamTracksCount, jams = n)
+#write.csv2(x = jamTracksCount, row.names = FALSE, file = "input-clean/jam_count.csv", quote=FALSE)
+```
+
+### 2. Count plays aggregated from multiple sites
+We also have aggregated counts of songs played across users from tasteprofile - https://labrosa.ee.columbia.edu/millionsong/tasteprofile
+
+First clean and transform the data using the following command line utilities.
+```{bash}
+#Instead of getting all counts and processing in R which consumes too much memory. Just compute <song_id, count(song_id)>
+awk '{count[$2]+=$3} END{for (w in count) printf "%s;%d\n", w, count[w]}' input-full/train_triplets.txt > input-full/mix_play_counts.csv
+
+# Get the <track id, song id>. It is faster/easier to use unix utilities
+grep -Po '<.+>' input-full/sid_mismatches.txt | tr -d '<>' | awk '{printf "%s;%s\n", $1, $2}'> input-full/mix_mismatches.csv
+#Doesnot work on Mac - works on terminal only TODO
+```
+
+There are some mismatches which we need to remove from the original counts. Although they have given a pair of <trackid, songid>, I removed by songid. This leads to loss of 18,000 songs from the original 3, 800, 000+ songs.
+```{r, echo=F}
+mixPlayCounts <- read.csv('input-full/mix_play_counts.csv', sep=';', col.names=c("song_id", "plays"), stringsAsFactors = FALSE)
+
+# Let the track id be in mixInvalid even though it's not used
+mixInvalid    <- read.csv('input-full/mix_mismatches.csv', sep=';', col.names=c("song_id", "track_id"), stringsAsFactors = FALSE)
+
+playCounts <- anti_join(mixPlayCounts, mixInvalid, "song_id")
+
+```
+
+### 3. Add jams, user plays back to original user dataset.
+
+```{r, echo=F}
+playsJamsSongInfo <- songInfo %>% 
+  left_join(playCounts, by="song_id") %>%
+  left_join(jamTracksCount, by="track_id")
+```
+
+
+### 4. Join all the tables to get unified data model
+
+```{r, cache=TRUE,echo=F}
+
+cleanedDownloads <- read.csv('input-full/clean_subset_downloads.csv', sep=';', header = TRUE, quote="", stringsAsFactors = FALSE)
+cleanedSongInfo  <- read.csv('input-full/clean_subset_song_info.csv', sep=';', header=TRUE, quote="", stringsAsFactors = FALSE)
+
+naCleanedDownloads <- subset(cleanedSongInfo, is.na(cleanedSongInfo$downloads))
+
+cleanedDownloads <- rename(cleanedDownloads, "artistname" = "artist")
+
+cleanedSongDownloads <- left_join(cleanedSongInfo, cleanedDownloads, by=c("artistname" = "artistname", "title" = "title"))
+naCleanedSongDownloads <- subset(cleanedSongDownloads, is.na(cleanedSongDownloads$downloads))
+
+cleanedSongDownloads <- rename(cleanedSongDownloads, "norm_title" = "title", "norm_artistname" = "artistname")
+
+fullSongInfo <- playsJamsSongInfo %>% 
+  left_join(cleanedSongDownloads, c("track_id" = "track_id", "song_id" = "song_id", "song_id", "artist_id" = "artist_id"))
+
+#fullSongInfo <- subset(fullSongInfo, select = -c(genre)) #includes all null values - need to verify TODO
+
+```
+
+
+```{r, cache=TRUE,echo=F, eval=F}
+extractedFields <- read.csv('input-full/extracted_fields_all.csv', sep=';', header = TRUE, quote="", stringsAsFactors = FALSE)
+fullSongInfo <- fullSongInfo %>% 
+  left_join(extractedFields, c("track_id" = "track_id", "song_id" = "song_id", "song_id", "artist_id" = "artist_id"))
+```
+
+### 4.3 More cleaning
+```{r, echo=F}
+# Look at the distribution here
+# summary(fullSongInfo$norm_song_hotness[!is.na(fullSongInfo$norm_song_hotness) && fullSongInfo$norm_song_hotness > 0])
+
+conf_mapper <- function(c) {
+  if (c == "poor")  return(0.1)
+  else if (c == "average") return (0.5)
+  else if (c == "good") return (0.75)
+  else if (c == "very good") return (0.9)#return (0.9)
+  else if (c == "excellent") return (1.0)
+  return (0.0)
+}
+
+fullSongInfo$norm_song_hotness <- with(fullSongInfo, ifelse(song_hotttnesss > 0 & song_hotttnesss < 1.0 & song_hotttnesss > 0.1,  song_hotttnesss, 0))
+fullSongInfo$bin_plays <- with(fullSongInfo, ifelse(!is.na(plays)  & plays > 0 & !is.na(song_hotttnesss), 1, 0))
+
+fullSongInfo$norm_duration <- with(fullSongInfo,  ifelse(start_of_fade_out - end_of_fade_in >= 60 & start_of_fade_out - end_of_fade_in < 120, 1,
+                                                   ifelse(start_of_fade_out - end_of_fade_in >= 120 & start_of_fade_out - end_of_fade_in < 180, 1,
+                                                     ifelse(start_of_fade_out - end_of_fade_in >= 180 & start_of_fade_out - end_of_fade_in < 480, 2,
+                                                     0))))
+
+fullSongInfo$norm_year <- with(fullSongInfo, ifelse(!is.na(year), year, 0))
+
+
+#head(fullSongInfo %>% mutate(dow_conf = conf_mapper(confidence)) %>% select(dow_conf))
+fullSongInfo$dow_conf <- with(fullSongInfo,  downloads * ifelse(confidence == "poor", 0.1,
+                                             ifelse(confidence == "average", 0.5,
+                                             ifelse(confidence == "good", 0.75,
+                                             ifelse(confidence == "very good", 0.90,
+                                             ifelse(confidence == "excellent", 1.0, 0))))))
+
+
+write.table(select(format(fullSongInfo, digits=6), norm_title, norm_artistname, mean_price, norm_song_hotness, artist_hotttnesss, artist_familiarity, loudness, dow_conf, bin_plays), 
+           file="input-clean/cleandf.csv", 
+           row.names=FALSE,
+           dec='.',
+           sep=';',
+           na="",
+           quote = FALSE)
+
+#DISCARDED
+#fullSongInfo$norm_song_hotness <- with(fullSongInfo, ifelse(song_hotttnesss > 0 & song_hotttnesss < 1.0, song_hotttnesss, NA))
+#fullSongInfo$bin_duration <- with(fullSongInfo, ifelse(duration >=60  & duration <= 450.0, 1, 0))
+#fullSongInfo$bin_tempo <- with(fullSongInfo, tempo)
+#fullSongInfo$bin_jams <- with(fullSongInfo, ifelse(!is.na(jams)  & jams > 0, 1, 0))
+
+
+#hist((filter(fullSongInfo, !is.na(song_hotttnesss) & downloads > 7000 & song_hotttnesss > 0) %>% select(downloads, song_hotttnesss) %>% arrange(desc(downloads)))$song_hotttnesss)
+#
+```
+
+### 5. Linear Model experiments for feature selection
+
+####  5.1 Selecting the Training model
+
+```{r, cache=TRUE,echo=F, eval=F}
+excellentFullSongInfo <- fullSongInfo#filter(fullSongInfo, confidence == 'excellent')
+ratio = sample(1:nrow(excellentFullSongInfo), size = 0.1*nrow(excellentFullSongInfo)) # Ramdomly choose observation from the dataframe
+Training = excellentFullSongInfo[ratio,] #Test dataset 30% of total
+Validation = fullSongInfo[-ratio,] #Train dataset 70% of total
+summary(Training)
+```
+
+
+
+
+```{r, cache=TRUE,echo=F, eval=F}
+#Training <- na.omit(Training)
+Training <- fullSongInfo
+#Training$confidence <- as.factor(Training$confidence)
+#Training$downloads[is.na(Training$downloads)] <- median(Training$downloads, na.rm=TRUE)
+Training$mean_price[is.na(Training$mean_price)] <- median(Training$mean_price, na.rm=TRUE)
+Training$norm_song_hotness[is.na(Training$norm_song_hotness)] <- median(Training$norm_song_hotness, na.rm=TRUE)
+Training$artist_hotttnesss[is.na(Training$artist_hotttnesss)] <- median(Training$artist_hotttnesss, na.rm=TRUE)
+Training$dow_conf[is.na(Training$dow_conf)] <- median(Training$dow_conf, na.rm=TRUE)
+Training$bin_plays[is.na(Training$bin_plays)] <- median(Training$bin_plays, na.rm=TRUE)
+Training$artist_familiarity[is.na(Training$artist_familiarity)] <- median(Training$artist_familiarity, na.rm=TRUE)
+Training$duration[is.na(Training$tempo)] <- median(Training$tempo, na.rm=TRUE)
+
+
+Training$loudness <- Training$loudness^2
+Training$loudness[is.na(Training$loudness)] <- median(Training$loudness, na.rm=TRUE)
+
+write.table(select(format(Training, digits=6), norm_title, norm_artistname, mean_price, norm_song_hotness, artist_hotttnesss, artist_familiarity, loudness, dow_conf, bin_plays), 
+           file="input-clean/cleandf.csv", 
+           row.names=FALSE,
+           dec='.',
+           sep=';',
+           na="",
+           quote=FALSE)
+
+
+summary(Training)
+
+#library(foreign)
+#library(data.table)
+#write.arff(Training,file="input-full/clean_model.arff")
+#write.arff(Validation,file="input-full/test_clean_model.arff")
+
+
+##num <- subset(num, select = -c(analysis_sample_rate,danceability,energy,mean.price))
+#m <- lm(downloads~., data = num)
+#summary(m)
+#qqnorm(m$residuals, main = "Normal qqplot of residuals")
+#qqline(m$residuals)
+
+```
+
+```{r, cache=TRUE,echo=F}
+require(randomForest)
+#num <- select_if(Training, is.numeric)
+#num <- subset(num, select = -c(analysis_sample_rate,danceability,energy,key,key_confidence,mode,mode_confidence,time_signature,time_signature_confidence,end_of_fade_in,start_of_fade_out,year,jams,max_pitch,plays,mean_loudness,min_pitch,max_beats,artist_familiarity))
+num = subset(Training, select=c(dow_conf, mean_price, norm_song_hotness, artist_hotttnesss, bin_plays, artist_familiarity, loudness, norm_year, norm_duration))
+
+
+
+model_rf<-randomForest(dow_conf ~ ., data = num)
+model_lm<- lm(dow_conf~., data = num)
+
+model_rf
+summary(model_rf)
+plot(model_rf)
+```
+
+

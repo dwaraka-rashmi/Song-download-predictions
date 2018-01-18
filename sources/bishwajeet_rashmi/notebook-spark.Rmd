@@ -1,0 +1,123 @@
+---
+title: "Crystal Discoball Notebook"
+output: html_notebook
+---
+
+```{r include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("ggplot2")
+require("reshape2")
+require("knitr")
+require("kableExtra")
+require("dplyr")
+require("RColorBrewer")
+require("stringr")
+
+
+library(SparkR, lib.loc = c(file.path(Sys.getenv("SPARK_HOME"), "R", "lib")))
+sparkR.session(master = "local[*]", sparkConfig = list(spark.driver.memory = "6g"))
+```
+
+
+```{r, echo=F}
+songInfo <- read.df('input-full/song_info.csv', source="csv",  delimiter=';', header=TRUE)#, quote="", stringsAsFactors = FALSE)
+```
+
+### 1. Count the number of jams
+
+Jams are equivalent of likes - https://labrosa.ee.columbia.edu/millionsong/thisismyjam . We have around 100,000+ tracks.
+
+```{r}
+jamTracks <- read.df("input-full/jam_to_msd.tsv", source="csv", delimiter='\t', header = FALSE)#, col.names=c("user_id", "track_id"))
+colnames(jamTracks) <- c("user_id", "track_id")
+
+jamTracksCount <- summarize(groupBy(jamTracks, jamTracks$track_id), jams=n(jamTracks$track_id))
+
+#jamTracksCount <- rename(jamTracksCount, jams = n)
+#write.csv2(x = jamTracksCount, row.names = FALSE, file = "input-clean/jam_count.csv", quote=FALSE)
+```
+
+### 2. Count plays aggregated from multiple sites
+We also have aggregated counts of songs played across users from tasteprofile - https://labrosa.ee.columbia.edu/millionsong/tasteprofile
+
+First clean and transform the data using the following command line utilities.
+```{bash}
+#Instead of getting all counts and processing in R which consumes too much memory. Just compute <song_id, count(song_id)>
+awk '{count[$2]+=$3} END{for (w in count) printf "%s;%d\n", w, count[w]}' input-full/train_triplets.txt > input-full/mix_play_counts.csv
+
+# Get the <track id, song id>. It is faster/easier to use unix utilities
+grep -Po '<.+>' input-full/sid_mismatches.txt | tr -d '<>' | awk '{printf "%s;%s\n", $1, $2}'> input-full/mix_mismatches.csv
+
+# Also, clean up output directory
+rm -rf /tmp/full-song-info
+```
+
+There are some mismatches which we need to remove from the original counts. Although they have given a pair of <trackid, songid>, I removed by songid. This leads to loss of 18,000 songs from the original 3, 800, 000+ songs.
+```{r, echo=F}
+#This file is 8.2 MB
+mixPlayCounts <- read.csv('input-full/mix_play_counts.csv', sep=';', col.names=c("song_id", "plays"), stringsAsFactors = FALSE)
+
+# This file is less than a MB
+# Let the track id be in mixInvalid even though it's not used
+mixInvalid    <- read.csv('input-full/mix_mismatches.csv', sep=';', col.names=c("song_id", "track_id"), stringsAsFactors = FALSE)
+
+playCounts <- anti_join(mixPlayCounts, mixInvalid, "song_id")
+
+playCounts <- createDataFrame(playCounts)
+```
+
+### 3. Add jams, user plays back to original user dataset.
+
+```{r, echo=F}
+playsJamsSongInfo <- drop(
+  join(drop(join(songInfo, playCounts, joinExpr = songInfo$song_id == playCounts$song_id, joinType = "left"), playCounts$song_id),
+     jamTracksCount, joinExpr = songInfo$track_id == jamTracksCount$track_id, joinType = "left"), jamTracksCount$track_id)
+
+#playsJamsSongInfo <- songInfo %>% 
+#  left_join(playCounts, by="song_id") %>%
+#  left_join(jamTracksCount, by="track_id")
+```
+
+
+### 4. 
+
+```{r, echo=F}
+
+cleanedDownloads <- read.df('input-full/clean_subset_downloads.csv', source="csv", delimiter=';', header = TRUE)
+
+cleanedSongInfo  <- read.df('input-full/clean_subset_song_info.csv', source="csv", delimiter=';', header=TRUE)
+
+cleanedDownloads <- withColumnRenamed(cleanedDownloads, "artist", "artistname")
+
+cleanedSongDownloads <-  drop(
+                          drop(join(cleanedSongInfo, cleanedDownloads, joinExpr = cleanedSongInfo$artistname == cleanedDownloads$artistname & 
+                               cleanedSongInfo$title == cleanedDownloads$title, joinType = "left"), 
+                             cleanedDownloads$artistname), 
+                          cleanedDownloads$title)
+
+cleanedSongDownloads <- rename(cleanedSongDownloads, norm_title = cleanedSongDownloads$title, norm_artistname = cleanedSongDownloads$artistname)
+
+fullSongInfo <- drop(
+                 drop(
+                  drop(
+                    join(playsJamsSongInfo, cleanedSongDownloads, joinExpr = playsJamsSongInfo$track_id == cleanedSongDownloads$track_id & 
+                       playsJamsSongInfo$song_id == cleanedSongDownloads$song_id &
+                       playsJamsSongInfo$artist_id == cleanedSongDownloads$artist_id),
+                       cleanedSongDownloads$track_id),
+                  cleanedSongDownloads$song_id),
+                 cleanedSongDownloads$artist_id)
+
+write.df(fullSongInfo, "/tmp/full-song-info", "csv", delimiter=';')
+write.csv2(as.data.frame(colnames(fullSongInfo)), '/tmp/header-number', quote=FALSE)
+                       
+#by = c("track_id" = "track_id", "song_id" = "song_id", "song_id", "artist_id" = "artist_id"), all.x=TRUE, all.y=TRUE)
+#fullSongInfo <- playsJamsSongInfo %>% 
+#  left_join(cleanedSongDownloads, c("track_id" = "track_id", "song_id" = "song_id", "song_id", "artist_id" = "artist_id"))
+```
+
+### 5. Combine and merge
+```{bash}
+cat /tmp/header-number | cut -d';' -f2 | awk 'NR>1{print}' | tr '\n' ';' | sed 's/;$//' > /tmp/header; echo >> /tmp/header
+cat /tmp/header /tmp/full-song-info/part-r-*.csv > input-clean/spark_song_info.csv
+
+```
