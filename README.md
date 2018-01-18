@@ -19,6 +19,6 @@ Build the project by typing command `make build`. Run the project locally by run
   uses the /tmp as the scratch directory for loading the model.
 
 # Project structure
-1. The project has both java and scala files. `src/main/java` contains the java files. `src/main/scala` contains the scala files.
+1. The project has both java and scala files. `sources/bishwajeet_rashmi/src/main/java` contains the java files. `sources/bishwajeet_rashmi/src/main/scala` contains the scala files.
 2. The RandomForest model is built using RFEngine. 
 3. The loading/deployment of the model is part of the Model class.
